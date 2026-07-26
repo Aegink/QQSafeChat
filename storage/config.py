@@ -40,10 +40,6 @@ class AppConfig:
     reply_random_min: float = 0.3
     reply_random_max: float = 1.8
 
-    
-    split_delimiter: str = "<<<NEXT>>>"
-
-    
     split_speed_multiplier: float = 1.0
 
     
@@ -65,6 +61,12 @@ class AppConfig:
     sticker_selector_series: str = ""
     sticker_selector_order: str = "desc"
     sticker_selector_embed_raw_min: float = 0.5
+
+    vision_enabled: bool = False
+    tts_enabled: bool = False
+    voice_send_mode: str = "file"
+    real_voice_output_device: str = ""
+    real_voice_start_delay_sec: float = 0.5
 
     
     persona_dir: str = "personas"

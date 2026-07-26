@@ -14,17 +14,25 @@ class OpenAISettings:
     model: str = "gpt-4.1-mini"
     temperature: float = 0.6
 
-    
-    system_prompt: str = "你是一个友好、简洁、不过度热情的聊天助手。"
+    system_prompt: str = "你是一个中文私聊代聊助手。你的回复要自然、像真人、克制，不要解释规则，不要写旁白。"
     user_template: str = (
-        "你是一个聊天助手。下面是聊天上下文（可能包含多行文件信息，已经合并成一个气泡）。\n"
-        "请你只对“对方”最新消息进行简短自然回复，不要复述上下文。\n\n"
+        "请根据聊天历史、对方最新消息和可选识图结果，输出一个 JSON actions 对象。\n\n"
         "【聊天上下文】\n"
         "{history}\n\n"
         "【对方最新消息】\n"
         "{incoming}\n\n"
-        "【你的回复】"
+        "【识图结果】\n"
+        "{image_context}"
     )
+    vision_model: str = ""
+    vision_prompt: str = "请用中文简洁描述这张聊天图片的关键信息，包含主体、动作、情绪和明显文字，控制在 80 字以内。"
+    tts_provider: str = "openai"
+    tts_model: str = "gpt-4o-mini-tts"
+    tts_voice: str = "alloy"
+    tts_format: str = "mp3"
+    tts_language_type: str = "auto"
+    tts_api_key: str = ""
+    tts_base_url: str = ""
 
 
 class SettingsStore:

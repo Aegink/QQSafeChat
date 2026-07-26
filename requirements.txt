@@ -2,5 +2,6 @@ Pillow
 pywebview
 pywin32
 Requests
+sounddevice
 ttkbootstrap
 uiautomation

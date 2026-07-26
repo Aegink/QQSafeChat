@@ -23,8 +23,10 @@ from core.models import BoundControl
 from storage.settings_store import OpenAISettings, SettingsStore
 from uia.uia_picker import (
     HighlightRect,
+    auto_detect_chat_bindings,
     build_bound_control,
     control_from_point_safe,
+    pick_chat_bind_root,
     reacquire,
 )
 from windows.ui_theme import (
@@ -39,7 +41,22 @@ from windows.ui_theme import (
     make_root_window,
     ttk,
 )
-from windows import DebugWindow, InfoWindow, SettingsWindow, StickerSettingsWindow, LogWindow
+from windows import DebugWindow, InfoWindow, SettingsWindow, LogWindow
+
+
+EDIT_COMPAT_CONTROL_TYPES = ("EditControl", "GroupControl")
+
+
+def _bind_target_types(expected_type: str) -> tuple[str, ...]:
+    if expected_type in EDIT_COMPAT_CONTROL_TYPES:
+        return EDIT_COMPAT_CONTROL_TYPES
+    return (expected_type,)
+
+
+def _bind_target_label(expected_type: str) -> str:
+    if expected_type in EDIT_COMPAT_CONTROL_TYPES:
+        return "EditControl/GroupControl"
+    return expected_type
 
 
 class App:
@@ -53,7 +70,6 @@ class App:
         self.debug_win: DebugWindow | None = None
         self._last_debug_payload: dict | None = None
         self.info_window: InfoWindow | None = None
-        self.sticker_settings_win: StickerSettingsWindow | None = None
 
         self.log_win: LogWindow | None = None
         self._status_log = deque(maxlen=2500)  # 存最近 2500 行，避免无限增长
@@ -85,9 +101,6 @@ class App:
         btns.pack(side="right")
 
         ttk.Button(btns, text="⚙ 设置", command=self.open_settings).pack(side="right")
-        ttk.Button(btns, text="Sticker", command=self.open_sticker_settings).pack(
-            side="right"
-        )
         ttk.Button(btns, text="❓ 帮助", command=self.open_help).pack(
             side="right", padx=(0, 8)
         )
@@ -128,21 +141,31 @@ class App:
         self.picking = False
         self.pick_expected_type: str | None = None
         self.hover_ctrl = None
+        self._auto_bind_after_id: str | None = None
 
         self.bound_edit: BoundControl | None = None
         self.bound_button: BoundControl | None = None
         self.bound_window: BoundControl | None = None
+        self.bound_voice_button: BoundControl | None = None
 
-        self.btn_bind_edit = ttk.Button(bind_box, text="绑定 输入框 (EditControl)")
+        self.btn_bind_edit = ttk.Button(
+            bind_box, text="绑定 输入框 (EditControl/GroupControl)"
+        )
         self.btn_bind_btn = ttk.Button(bind_box, text="绑定 发送按钮 (ButtonControl)")
+        self.btn_bind_voice = ttk.Button(bind_box, text="绑定 语音消息按钮 (ButtonControl)")
         self.btn_bind_win = ttk.Button(bind_box, text="绑定 消息列表 (WindowControl)")
+        self.btn_auto_bind = ttk.Button(
+            bind_box, text="尝试自动绑定（点击后切到聊天窗）", command=self.schedule_auto_bind
+        )
 
         self.btn_bind_edit.pack(fill="x", pady=4)
         self.btn_bind_btn.pack(fill="x", pady=4)
+        self.btn_bind_voice.pack(fill="x", pady=4)
         self.btn_bind_win.pack(fill="x", pady=4)
+        self.btn_auto_bind.pack(fill="x", pady=(4, 0))
 
         self.bind_state_var = tk.StringVar(
-            value="Edit: 未绑定 | Button: 未绑定 | Window: 未绑定"
+            value="Edit: 未绑定 | Button: 未绑定 | Voice: 未绑定 | Window: 未绑定"
         )
         ttk.Label(bind_box, textvariable=self.bind_state_var).pack(
             fill="x", pady=(8, 0)
@@ -280,24 +303,31 @@ class App:
         self.engine.set_auto_reply(bool(self.auto_reply_var.get()))
 
         self.btn_bind_edit.bind(
-            "<ButtonPress-1>", lambda e: self.start_pick("EditControl")
+            "<ButtonPress-1>", lambda e: self.start_pick("EditControl", "输入框")
         )
         self.btn_bind_edit.bind(
-            "<ButtonRelease-1>", lambda e: self.stop_pick_and_bind("EditControl")
+            "<ButtonRelease-1>", lambda e: self.stop_pick_and_bind("edit", "EditControl", "输入框")
         )
 
         self.btn_bind_btn.bind(
-            "<ButtonPress-1>", lambda e: self.start_pick("ButtonControl")
+            "<ButtonPress-1>", lambda e: self.start_pick("ButtonControl", "发送按钮")
         )
         self.btn_bind_btn.bind(
-            "<ButtonRelease-1>", lambda e: self.stop_pick_and_bind("ButtonControl")
+            "<ButtonRelease-1>", lambda e: self.stop_pick_and_bind("send_button", "ButtonControl", "发送按钮")
+        )
+
+        self.btn_bind_voice.bind(
+            "<ButtonPress-1>", lambda e: self.start_pick("ButtonControl", "语音消息按钮")
+        )
+        self.btn_bind_voice.bind(
+            "<ButtonRelease-1>", lambda e: self.stop_pick_and_bind("voice_button", "ButtonControl", "语音消息按钮")
         )
 
         self.btn_bind_win.bind(
-            "<ButtonPress-1>", lambda e: self.start_pick("WindowControl")
+            "<ButtonPress-1>", lambda e: self.start_pick("WindowControl", "消息列表")
         )
         self.btn_bind_win.bind(
-            "<ButtonRelease-1>", lambda e: self.stop_pick_and_bind("WindowControl")
+            "<ButtonRelease-1>", lambda e: self.stop_pick_and_bind("window", "WindowControl", "消息列表")
         )
 
         self.root.after(30, self.pick_loop)
@@ -399,26 +429,6 @@ class App:
             self.apply_cfg_settings,
         )
 
-    def open_sticker_settings(self):
-        win = getattr(self, "sticker_settings_win", None)
-        if win and win.winfo_exists():
-            win.lift()
-            return
-
-        self.sticker_settings_win = StickerSettingsWindow(
-            self.root, self.cfg, self.apply_cfg_settings
-        )
-
-        def _on_destroy(event):
-            if getattr(event, "widget", None) is self.sticker_settings_win:
-                self.sticker_settings_win = None
-
-        try:
-            self.sticker_settings_win.bind("<Destroy>", _on_destroy)
-            self.sticker_settings_win.lift()
-        except Exception:
-            pass
-
     def apply_settings(self, s: OpenAISettings):
         self.llm = self.make_llm_client(s)
         if hasattr(self.llm, "set_debug_hook"):
@@ -433,7 +443,8 @@ class App:
         self.set_status(
             f"✅ 行为/人格设置已应用：delay={cfg.reply_stop_seconds}s mode={cfg.reply_delay_mode}, "
             f"speedx={cfg.split_speed_multiplier}, persona={cfg.persona_file or '无'}, "
-            f"sticker={'开' if cfg.sticker_selector_enabled else '关'}"
+            f"sticker={'开' if cfg.sticker_selector_enabled else '关'}, "
+            f"vision={'开' if cfg.vision_enabled else '关'}, tts={'开' if cfg.tts_enabled else '关'}, voice_mode={cfg.voice_send_mode}"
         )
 
     def make_llm_client(self, s: OpenAISettings):
@@ -446,6 +457,15 @@ class App:
                 temperature=s.temperature,
                 system_prompt=s.system_prompt,
                 user_template=s.user_template,
+                vision_model=s.vision_model,
+                vision_prompt=s.vision_prompt,
+                tts_provider=s.tts_provider,
+                tts_model=s.tts_model,
+                tts_voice=s.tts_voice,
+                tts_format=s.tts_format,
+                tts_language_type=s.tts_language_type,
+                tts_api_key=s.tts_api_key,
+                tts_base_url=s.tts_base_url,
             )
         elif provider == "siliconflow":
             return SiliconFlowClient(
@@ -455,6 +475,15 @@ class App:
                 temperature=s.temperature,
                 system_prompt=s.system_prompt,
                 user_template=s.user_template,
+                vision_model=s.vision_model,
+                vision_prompt=s.vision_prompt,
+                tts_provider=s.tts_provider,
+                tts_model=s.tts_model,
+                tts_voice=s.tts_voice,
+                tts_format=s.tts_format,
+                tts_language_type=s.tts_language_type,
+                tts_api_key=s.tts_api_key,
+                tts_base_url=s.tts_base_url,
             )
         return MockLLMClient()
 
@@ -509,22 +538,25 @@ class App:
             return "✅" if b else "未绑定"
 
         self.bind_state_var.set(
-            f"Edit: {fmt(self.bound_edit)} | Button: {fmt(self.bound_button)} | Window: {fmt(self.bound_window)}"
+            f"Edit: {fmt(self.bound_edit)} | Button: {fmt(self.bound_button)} | Voice: {fmt(self.bound_voice_button)} | Window: {fmt(self.bound_window)}"
         )
         self.engine.bound_edit = self.bound_edit
         self.engine.bound_button = self.bound_button
+        self.engine.bound_voice_button = self.bound_voice_button
         self.engine.bound_window = self.bound_window
 
         ready = self.engine.is_ready()
         self.btn_start.configure(state=("normal" if ready else "disabled"))
 
-    def start_pick(self, expected_type: str):
+    def start_pick(self, expected_type: str, target_name: str):
         self.picking = True
         self.pick_expected_type = expected_type
         win32api.SetCursor(win32gui.LoadCursor(0, win32con.IDC_CROSS))
-        self.set_status(f"正在拾取：移到目标 {expected_type} 上，松开锁定…")
+        self.set_status(
+            f"正在拾取：移到目标 {target_name}（{_bind_target_label(expected_type)}）上，松开锁定…"
+        )
 
-    def stop_pick_and_bind(self, expected_type: str):
+    def stop_pick_and_bind(self, bind_slot: str, expected_type: str, target_name: str):
         self.picking = False
         win32api.SetCursor(win32gui.LoadCursor(0, win32con.IDC_ARROW))
         self.highlight.hide()
@@ -538,14 +570,19 @@ class App:
 
         # 尝试查找指定类型的控件，如果当前控件类型不匹配，则查找其子控件
         matched_ctrl = ctrl
+        target_types = _bind_target_types(expected_type)
+        target_label = _bind_target_label(expected_type)
         try:
-            if ctrl.ControlTypeName != expected_type:
+            ctrl_type = getattr(ctrl, "ControlTypeName", "") or ""
+            if ctrl_type not in target_types:
                 # 从uia_picker导入find_child_control_by_type函数
                 from uia.uia_picker import find_child_control_by_type
-                matched_ctrl = find_child_control_by_type(ctrl, expected_type)
+
+                preferred_name = "语音消息" if bind_slot == "voice_button" else ""
+                matched_ctrl = find_child_control_by_type(ctrl, expected_type, preferred_name=preferred_name)
                 if not matched_ctrl:
                     self.set_status(
-                        f"选中的不是 {expected_type}，而是 {ctrl.ControlTypeName}"
+                        f"选中的不是 {target_label}，而是 {ctrl_type or '未知控件'}"
                     )
                     return
         except Exception as e:
@@ -557,17 +594,117 @@ class App:
             self.set_status("绑定失败（无法获取 rect）")
             return
 
-        if expected_type == "EditControl":
+        if bind_slot == "edit":
             self.bound_edit = bound
-        elif expected_type == "ButtonControl":
+        elif bind_slot == "send_button":
             self.bound_button = bound
-        elif expected_type == "WindowControl":
+        elif bind_slot == "voice_button":
+            self.bound_voice_button = bound
+        elif bind_slot == "window":
             self.bound_window = bound
 
-        self.set_status(f"✅ 已绑定 {expected_type}")
-        if expected_type == "EditControl" and self.auto_history_var.get():
+        actual_type = bound.actual_type or bound.expected_type
+        if bind_slot == "edit":
+            self.set_status(f"✅ 已绑定 输入框控件（{actual_type}）")
+        elif bind_slot == "send_button":
+            self.set_status(
+                f"✅ 已绑定 发送按钮（名称={bound.name or '无名'} | 实际={actual_type}）"
+            )
+        elif bind_slot == "voice_button":
+            self.set_status(
+                f"✅ 已绑定 语音消息按钮（名称={bound.name or '无名'} | 实际={actual_type}）"
+            )
+        else:
+            self.set_status(f"✅ 已绑定 {target_name}（实际={actual_type}）")
+        if bind_slot == "edit" and self.auto_history_var.get():
             self.auto_load_history_for_bound_edit()
         self.update_bind_state()
+
+    def schedule_auto_bind(self):
+        if self._auto_bind_after_id is not None:
+            try:
+                self.root.after_cancel(self._auto_bind_after_id)
+            except Exception:
+                pass
+
+        self.set_status("3 秒内切到目标 QQ 聊天窗口，程序将尝试自动绑定…")
+        self._auto_bind_after_id = self.root.after(3000, self.auto_bind_foreground_window)
+
+    def auto_bind_foreground_window(self):
+        self._auto_bind_after_id = None
+
+        try:
+            app_root_hwnd = win32gui.GetAncestor(self.tk_hwnd, win32con.GA_ROOT)
+        except Exception:
+            app_root_hwnd = self.tk_hwnd
+
+        try:
+            fg_hwnd = win32gui.GetForegroundWindow()
+        except Exception as exc:
+            self.set_status(f"自动绑定失败：无法获取前台窗口 ({exc})")
+            return
+
+        if not fg_hwnd or fg_hwnd == app_root_hwnd:
+            self.set_status("自动绑定失败：请点击按钮后立即切到目标 QQ 聊天窗口。")
+            return
+
+        try:
+            title = win32gui.GetWindowText(fg_hwnd) or "未知窗口"
+        except Exception:
+            title = "未知窗口"
+
+        try:
+            with auto.UIAutomationInitializerInThread():
+                root_ctrl = pick_chat_bind_root(fg_hwnd)
+                detected = auto_detect_chat_bindings(root_ctrl) if root_ctrl else {}
+        except Exception as exc:
+            self.set_status(f"自动绑定失败：扫描窗口 {title} 时出错 ({exc})")
+            return
+
+        edit_bound = build_bound_control(detected.get("edit"), "EditControl") if detected.get("edit") else None
+        button_bound = build_bound_control(detected.get("button"), "ButtonControl") if detected.get("button") else None
+        voice_button_bound = build_bound_control(detected.get("voice_button"), "ButtonControl") if detected.get("voice_button") else None
+        window_bound = build_bound_control(detected.get("window"), "WindowControl") if detected.get("window") else None
+
+        if button_bound:
+            button_blob = " ".join(
+                [
+                    button_bound.name or "",
+                    button_bound.automation_id or "",
+                    button_bound.class_name or "",
+                ]
+            ).lower()
+            if any(k in button_blob for k in ("关闭", "close", "最小化", "minimize", "最大化", "maximize", "还原", "restore")):
+                self.set_status(
+                    f"自动绑定失败：识别到的按钮疑似标题栏按钮（{button_bound.name or button_bound.class_name or '未知按钮'}），已拒绝自动绑定，请手动绑定发送按钮。"
+                )
+                return
+
+        if not (edit_bound and button_bound and window_bound):
+            missing = []
+            if not edit_bound:
+                missing.append("输入框")
+            if not button_bound:
+                missing.append("发送按钮")
+            if not window_bound:
+                missing.append("消息列表")
+            self.set_status(
+                f"自动绑定失败：前台窗口 {title} 未识别出 {'/'.join(missing)}，请继续手动绑定。"
+            )
+            return
+
+        self.bound_edit = edit_bound
+        self.bound_button = button_bound
+        self.bound_voice_button = voice_button_bound
+        self.bound_window = window_bound
+        self.update_bind_state()
+
+        if self.auto_history_var.get():
+            self.auto_load_history_for_bound_edit()
+
+        self.set_status(
+            f"✅ 已自动绑定前台窗口：{title} | 输入={edit_bound.actual_type or edit_bound.expected_type} | 发送={button_bound.name or '无名'} | 语音={voice_button_bound.name if voice_button_bound else '未识别'} | 列表={window_bound.actual_type or window_bound.expected_type}"
+        )
 
     def pick_loop(self):
         if self.picking and self.pick_expected_type:
@@ -600,6 +737,8 @@ class App:
         if self.engine.running:
             self.btn_start.configure(state="disabled")
             self.btn_stop.configure(state="normal")
+            if bool(self.cfg.tts_enabled) and str(self.cfg.voice_send_mode or "file").strip().lower() == "real" and not self.bound_voice_button:
+                self.set_status("⚠️ 当前为真语音模式，但还没有绑定“语音消息”按钮，voice action 会失败")
 
     def stop_bot(self):
         self.engine.stop()

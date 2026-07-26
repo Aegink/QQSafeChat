@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 import json
+import os
 import tkinter as tk
 from typing import Any
 
@@ -48,6 +49,7 @@ class DebugWindow(tk.Toplevel):
         self._error_text = self._make_tab("Error")
 
         self._last: dict[str, str] = {
+            "phase": "",
             "system": "",
             "user": "",
             "payload": "",
@@ -58,6 +60,35 @@ class DebugWindow(tk.Toplevel):
             "raw_response": "",
             "error": "",
         }
+
+    def _update_title(self):
+        phase = (self._last.get("phase") or "").strip()
+        if not phase:
+            self._title_var.set("等待第一条 debug 数据…")
+            return
+
+        provider = ""
+        model = ""
+        image_name = ""
+        try:
+            meta = json.loads(self._last.get("meta") or "{}")
+        except Exception:
+            meta = {}
+        if isinstance(meta, dict):
+            provider = str(meta.get("provider") or "").strip()
+            model = str(meta.get("model") or "").strip()
+            image_name = os.path.basename(str(meta.get("image_path") or "").strip())
+
+        parts = [f"phase={phase}"]
+        if provider:
+            parts.append(f"provider={provider}")
+        if model:
+            parts.append(f"model={model}")
+        if image_name:
+            parts.append(f"image={image_name}")
+        if self._last.get("error"):
+            parts.append("status=error")
+        self._title_var.set(" | ".join(parts))
 
     def _make_tab(self, title: str) -> tk.Text:
         frm = ttk.Frame(self.nb)
@@ -96,6 +127,9 @@ class DebugWindow(tk.Toplevel):
         return str(parts)
 
     def update_debug(self, data: dict):
+        if "phase" in data:
+            self._last["phase"] = (data.get("phase") or "").strip()
+
         
         if "system" in data:
             self._last["system"] = (data.get("system") or "").strip()
@@ -142,6 +176,7 @@ class DebugWindow(tk.Toplevel):
         self._set_text(self._usage_text, self._last.get("usage_finish", ""))
         self._set_text(self._raw_response_text, self._last.get("raw_response", ""))
         self._set_text(self._error_text, self._last.get("error", ""))
+        self._update_title()
 
     def _set_text(self, widget: tk.Text, content: str):
         widget.delete("1.0", tk.END)

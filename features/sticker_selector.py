@@ -187,12 +187,3 @@ class StickerSelectorClient:
             parts.append(f"fit={fit_rate}")
         return " | ".join(parts) or url or tag_str or "(no sticker)"
 
-    @staticmethod
-    def extract_prompts(text: str) -> List[str]:
-        return re.findall(r"<<<([^<>]+?)>>>", text) if text else []
-
-    @staticmethod
-    def strip_prompts(text: str) -> str:
-        if not text:
-            return ""
-        return re.sub(r"<<<[^<>]+?>>>", "", text)

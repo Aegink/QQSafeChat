@@ -14,8 +14,19 @@ def bring_to_foreground(hwnd: int | None):
     except Exception:
         pass
     try:
-        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        elif not win32gui.IsWindowVisible(hwnd):
+            show_cmd = win32con.SW_SHOWMAXIMIZED if win32gui.IsZoomed(hwnd) else win32con.SW_SHOW
+            win32gui.ShowWindow(hwnd, show_cmd)
+    except Exception:
+        pass
+    try:
+        win32gui.BringWindowToTop(hwnd)
+    except Exception:
+        pass
+    try:
+        win32gui.SetActiveWindow(hwnd)
     except Exception:
         pass
     try:

@@ -7,7 +7,8 @@ from storage.persona_store import PersonaStore
 from storage.settings_store import SettingsStore
 from windows.ui_theme import FONT_MONO, FONT_UI, apply_window_icon, ttk
 import json
-from core.llm_client import resolve_env, MockLLMClient, OpenAIClient
+from core.audio_output import DEFAULT_OUTPUT_DEVICE_LABEL, list_output_devices
+from core.llm_client import resolve_env, MockLLMClient, OpenAIClient, SiliconFlowClient
 
 
 class SettingsWindow(tk.Toplevel):
@@ -31,6 +32,7 @@ class SettingsWindow(tk.Toplevel):
         self.persona_dirty: dict[str, bool] = {}
         self._persona_current_name: str = ""
         self._persona_original_text: str = ""
+        self._real_voice_device_error: str = ""
 
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
@@ -43,16 +45,19 @@ class SettingsWindow(tk.Toplevel):
 
         self.tab_llm = ttk.Frame(nb, padding=10)
         self.tab_behavior = ttk.Frame(nb, padding=10)
+        self.tab_features = ttk.Frame(nb, padding=10)
         self.tab_persona = ttk.Frame(nb, padding=10)
         self.tab_prompt = ttk.Frame(nb, padding=10)
 
         nb.add(self.tab_llm, text="LLM")
         nb.add(self.tab_behavior, text="行为")
+        nb.add(self.tab_features, text="功能")
         nb.add(self.tab_persona, text="人格")
         nb.add(self.tab_prompt, text="Prompt 预览")
 
         self._build_llm_tab()
         self._build_behavior_tab()
+        self._build_features_tab()
         self._build_persona_tab()
         self._build_prompt_tab()
 
@@ -102,7 +107,7 @@ class SettingsWindow(tk.Toplevel):
 
         tip = (
             "提示：任意输入以 $ 开头（例如 $OPENAI_API_KEY），将从环境变量读取。\n"
-            "User Template 支持 {history} 和 {incoming} 两个占位符。"
+            "User Template 支持 {history}、{incoming} 和 {image_context} 三个占位符。"
         )
         ttk.Label(frm, text=tip).pack(anchor="w", pady=(0, 10))
 
@@ -159,16 +164,16 @@ class SettingsWindow(tk.Toplevel):
 
     def fill_example(self):
         self.system_text.delete("1.0", tk.END)
-        self.system_text.insert("1.0", "你是一个友好、自然、简洁的聊天助手。")
+        self.system_text.insert("1.0", "你是一个中文私聊代聊助手。回复要像真人，不要写旁白，不要解释规则。")
 
         example = (
-            "你是一个聊天助手。下面是聊天上下文（可能包含多行文件信息，已经合并成一个气泡）。\n"
-            "请你只对“对方”最新消息进行简短自然回复，不要复述上下文。\n\n"
+            "请根据聊天历史、对方最新消息和可选识图结果，输出一个 JSON actions 对象。\n\n"
             "【聊天上下文】\n"
             "{history}\n\n"
             "【对方最新消息】\n"
             "{incoming}\n\n"
-            "【你的回复】"
+            "【识图结果】\n"
+            "{image_context}"
         )
         self.user_text.delete("1.0", tk.END)
         self.user_text.insert("1.0", example)
@@ -223,25 +228,146 @@ class SettingsWindow(tk.Toplevel):
 
         self._refresh_delay_mode()
 
-        box2 = ttk.Labelframe(frm, text="分割消息发送速度", padding=10)
+        box2 = ttk.Labelframe(frm, text="多段消息发送节奏", padding=10)
         box2.pack(fill="x", pady=(10, 0))
 
-        self.split_delim_var = tk.StringVar(value=self.cfg.split_delimiter)
         self.speed_mult_var = tk.StringVar(value=str(self.cfg.split_speed_multiplier))
-
-        rowa = ttk.Frame(box2)
-        rowa.pack(fill="x", pady=4)
-        ttk.Label(rowa, text="分隔符", width=14).pack(side="left")
-        ttk.Entry(rowa, textvariable=self.split_delim_var, width=18).pack(side="left")
-        ttk.Label(rowa, text="AI 用它把回复拆成多条").pack(side="left", padx=8)
 
         rowb = ttk.Frame(box2)
         rowb.pack(fill="x", pady=4)
         ttk.Label(rowb, text="速度倍率", width=14).pack(side="left")
         ttk.Entry(rowb, textvariable=self.speed_mult_var, width=10).pack(side="left")
-        ttk.Label(rowb, text="1.0=正常；2.0更快；0.5更慢（影响分割消息之间间隔）").pack(
+        ttk.Label(rowb, text="1.0=正常；2.0更快；0.5更慢（影响 actions 之间的间隔）").pack(
             side="left", padx=8
         )
+
+    def _build_features_tab(self):
+        frm = self.tab_features
+
+        sticker_box = ttk.Labelframe(frm, text="贴图回复", padding=10)
+        sticker_box.pack(fill="x")
+
+        self.sticker_enabled_var = tk.BooleanVar(value=bool(getattr(self.cfg, "sticker_selector_enabled", False)))
+        ttk.Checkbutton(sticker_box, text="启用贴图动作", variable=self.sticker_enabled_var).pack(anchor="w")
+
+        self.sticker_api_var = tk.StringVar(value=getattr(self.cfg, "sticker_selector_api", "") or "")
+        self.sticker_k_var = tk.StringVar(value=str(getattr(self.cfg, "sticker_selector_k", 3) or 3))
+        self.sticker_random_var = tk.BooleanVar(value=bool(getattr(self.cfg, "sticker_selector_random", False)))
+
+        row_api = ttk.Frame(sticker_box)
+        row_api.pack(fill="x", pady=(6, 0))
+        ttk.Label(row_api, text="API", width=12).pack(side="left")
+        ttk.Entry(row_api, textvariable=self.sticker_api_var).pack(side="left", fill="x", expand=True)
+
+        row_k = ttk.Frame(sticker_box)
+        row_k.pack(fill="x", pady=(6, 0))
+        ttk.Label(row_k, text="候选数 k", width=12).pack(side="left")
+        ttk.Spinbox(row_k, from_=1, to=6, textvariable=self.sticker_k_var, width=6).pack(side="left")
+        ttk.Checkbutton(row_k, text="随机挑选", variable=self.sticker_random_var).pack(side="left", padx=12)
+
+        ttk.Label(sticker_box, text="贴图动作说明（给模型看）").pack(anchor="w", pady=(8, 4))
+        self.sticker_prompt_text = tk.Text(sticker_box, height=5, wrap="word", font=FONT_UI)
+        self.sticker_prompt_text.pack(fill="x")
+        self.sticker_prompt_text.insert("1.0", getattr(self.cfg, "sticker_selector_prompt", "") or "当需要发贴图时，使用 sticker action，并给出 2~5 个中文标签。")
+
+        vision_box = ttk.Labelframe(frm, text="识图", padding=10)
+        vision_box.pack(fill="x", pady=(10, 0))
+
+        self.vision_enabled_var = tk.BooleanVar(value=bool(getattr(self.cfg, "vision_enabled", False)))
+        ttk.Checkbutton(vision_box, text="启用自动识图（检测到对方图片时自动复制并识别）", variable=self.vision_enabled_var).pack(anchor="w")
+
+        self.vision_model_var = tk.StringVar(value=self.store.settings.vision_model)
+        row_vm = ttk.Frame(vision_box)
+        row_vm.pack(fill="x", pady=(6, 0))
+        ttk.Label(row_vm, text="识图模型", width=12).pack(side="left")
+        ttk.Entry(row_vm, textvariable=self.vision_model_var).pack(side="left", fill="x", expand=True)
+
+        ttk.Label(vision_box, text="识图提示词").pack(anchor="w", pady=(8, 4))
+        self.vision_prompt_text = tk.Text(vision_box, height=4, wrap="word", font=FONT_UI)
+        self.vision_prompt_text.pack(fill="x")
+        self.vision_prompt_text.insert("1.0", self.store.settings.vision_prompt)
+
+        tts_box = ttk.Labelframe(frm, text="语音发送（TTS）", padding=10)
+        tts_box.pack(fill="x", pady=(10, 0))
+
+        self.tts_enabled_var = tk.BooleanVar(value=bool(getattr(self.cfg, "tts_enabled", False)))
+        ttk.Checkbutton(tts_box, text="启用 voice action", variable=self.tts_enabled_var, command=self._refresh_voice_mode).pack(anchor="w")
+
+        self.voice_send_mode_var = tk.StringVar(value=str(getattr(self.cfg, "voice_send_mode", "file") or "file"))
+        default_device = str(getattr(self.cfg, "real_voice_output_device", "") or "").strip() or DEFAULT_OUTPUT_DEVICE_LABEL
+        self.real_voice_device_var = tk.StringVar(value=default_device)
+        self.real_voice_delay_var = tk.StringVar(value=str(getattr(self.cfg, "real_voice_start_delay_sec", 0.5) or 0.5))
+        self.real_voice_hint_var = tk.StringVar(value="")
+        self.real_voice_device_status_var = tk.StringVar(value="")
+
+        self.tts_model_var = tk.StringVar(value=self.store.settings.tts_model)
+        self.tts_voice_var = tk.StringVar(value=self.store.settings.tts_voice)
+        self.tts_format_var = tk.StringVar(value=self.store.settings.tts_format or "mp3")
+        self.tts_provider_var = tk.StringVar(value=getattr(self.store.settings, "tts_provider", "openai") or "openai")
+        self.tts_language_type_var = tk.StringVar(value=getattr(self.store.settings, "tts_language_type", "auto") or "auto")
+        self.tts_api_key_var = tk.StringVar(value=getattr(self.store.settings, "tts_api_key", "") or "")
+        self.tts_base_url_var = tk.StringVar(value=getattr(self.store.settings, "tts_base_url", "") or "")
+
+        row_tp = ttk.Frame(tts_box)
+        row_tp.pack(fill="x", pady=(6, 0))
+        ttk.Label(row_tp, text="TTS 提供方", width=12).pack(side="left")
+        ttk.Combobox(row_tp, textvariable=self.tts_provider_var, values=["openai", "qwen"], width=12, state="readonly").pack(side="left")
+
+        row_turl = ttk.Frame(tts_box)
+        row_turl.pack(fill="x", pady=(6, 0))
+        ttk.Label(row_turl, text="TTS URL", width=12).pack(side="left")
+        ttk.Entry(row_turl, textvariable=self.tts_base_url_var).pack(side="left", fill="x", expand=True)
+
+        row_tkey = ttk.Frame(tts_box)
+        row_tkey.pack(fill="x", pady=(6, 0))
+        ttk.Label(row_tkey, text="TTS Key", width=12).pack(side="left")
+        ttk.Entry(row_tkey, textvariable=self.tts_api_key_var, show="*").pack(side="left", fill="x", expand=True)
+
+        ttk.Label(tts_box, text="留空时回退使用 LLM 页的 Base URL 和 API Key。OpenAI 可填基础 URL 或完整的 /audio/speech；千问可填基础 URL 或完整的 /multimodal-generation/generation。", justify="left", wraplength=760).pack(anchor="w", pady=(6, 0))
+
+        row_tm = ttk.Frame(tts_box)
+        row_tm.pack(fill="x", pady=(6, 0))
+        ttk.Label(row_tm, text="TTS 模型", width=12).pack(side="left")
+        ttk.Entry(row_tm, textvariable=self.tts_model_var).pack(side="left", fill="x", expand=True)
+
+        row_tv = ttk.Frame(tts_box)
+        row_tv.pack(fill="x", pady=(6, 0))
+        ttk.Label(row_tv, text="Voice", width=12).pack(side="left")
+        ttk.Entry(row_tv, textvariable=self.tts_voice_var, width=18).pack(side="left")
+        ttk.Label(row_tv, text="格式", width=8).pack(side="left", padx=(12, 4))
+        ttk.Combobox(row_tv, textvariable=self.tts_format_var, values=["mp3", "wav", "ogg", "m4a"], width=8, state="readonly").pack(side="left")
+
+        row_tlang = ttk.Frame(tts_box)
+        row_tlang.pack(fill="x", pady=(6, 0))
+        ttk.Label(row_tlang, text="语言类型", width=12).pack(side="left")
+        ttk.Combobox(row_tlang, textvariable=self.tts_language_type_var, values=["auto", "Chinese", "English"], width=18, state="readonly").pack(side="left")
+
+        row_mode = ttk.Frame(tts_box)
+        row_mode.pack(fill="x", pady=(8, 0))
+        ttk.Label(row_mode, text="发送模式", width=12).pack(side="left")
+        ttk.Radiobutton(row_mode, text="文件", value="file", variable=self.voice_send_mode_var, command=self._refresh_voice_mode).pack(side="left")
+        ttk.Radiobutton(row_mode, text="真语音", value="real", variable=self.voice_send_mode_var, command=self._refresh_voice_mode).pack(side="left", padx=(12, 0))
+
+        row_dev = ttk.Frame(tts_box)
+        row_dev.pack(fill="x", pady=(6, 0))
+        ttk.Label(row_dev, text="扬声器", width=12).pack(side="left")
+        self.real_voice_device_combo = ttk.Combobox(row_dev, textvariable=self.real_voice_device_var, width=58, state="readonly")
+        self.real_voice_device_combo.pack(side="left", fill="x", expand=True)
+        self.real_voice_refresh_btn = ttk.Button(row_dev, text="刷新列表", command=self._refresh_output_devices)
+        self.real_voice_refresh_btn.pack(side="left", padx=(8, 0))
+        ttk.Label(tts_box, textvariable=self.real_voice_device_status_var).pack(anchor="w", pady=(4, 0))
+
+        row_delay = ttk.Frame(tts_box)
+        row_delay.pack(fill="x", pady=(6, 0))
+        ttk.Label(row_delay, text="录音校准", width=12).pack(side="left")
+        self.real_voice_delay_ent = ttk.Entry(row_delay, textvariable=self.real_voice_delay_var, width=10)
+        self.real_voice_delay_ent.pack(side="left")
+        ttk.Label(row_delay, text="秒（按住空格后，等待这么久再开始播到扬声器）").pack(side="left", padx=8)
+
+        ttk.Label(tts_box, textvariable=self.real_voice_hint_var, wraplength=760, justify="left").pack(anchor="w", pady=(8, 0))
+
+        self._refresh_output_devices()
+        self._refresh_voice_mode()
 
     def _refresh_delay_mode(self):
         mode = (self.delay_mode_var.get() or "fixed").strip().lower()
@@ -252,6 +378,57 @@ class SettingsWindow(tk.Toplevel):
             self.rand_max_ent.configure(state=state)
         except Exception:  # noqa: BLE001
             pass
+
+    def _update_voice_hint(self):
+        enabled = bool(self.tts_enabled_var.get())
+        mode = (self.voice_send_mode_var.get() or "file").strip().lower()
+        lines: list[str] = []
+        if not enabled:
+            lines.append("voice action 已关闭，模型即使生成 voice action 也不会走语音发送。")
+        elif mode == "real":
+            lines.append("真语音模式：先切到 QQ 录音页，按住空格录音，延迟后把 TTS 播到所选扬声器，完成后自动按 Esc 返回输入页。")
+            lines.append("真语音模式会固定请求 WAV 音频，并需要在主界面手动绑定“语音消息”按钮。")
+            current_device = (self.real_voice_device_var.get() or "").strip()
+            if not current_device or current_device == DEFAULT_OUTPUT_DEVICE_LABEL:
+                lines.append("当前未单独指定扬声器，将使用系统默认输出设备。")
+        else:
+            lines.append("文件模式：先生成音频文件，粘贴到 QQ 后自动按 Enter 确认发送。")
+
+        if self._real_voice_device_error:
+            lines.append(f"扬声器列表读取失败：{self._real_voice_device_error}")
+        self.real_voice_hint_var.set(" ".join(lines))
+
+    def _refresh_output_devices(self):
+        labels, error = list_output_devices()
+        self._real_voice_device_error = error
+        values = [DEFAULT_OUTPUT_DEVICE_LABEL, *labels]
+        values_tuple = tuple(values)
+        try:
+            self.real_voice_device_combo.configure(values=values_tuple)
+        except Exception:
+            try:
+                self.real_voice_device_combo["values"] = values_tuple
+            except Exception:
+                pass
+        current = (self.real_voice_device_var.get() or "").strip()
+        if not current or current not in values_tuple:
+            self.real_voice_device_var.set(DEFAULT_OUTPUT_DEVICE_LABEL)
+        if error:
+            self.real_voice_device_status_var.set(f"设备列表读取失败：{error}")
+        else:
+            self.real_voice_device_status_var.set(f"已检测到 {len(labels)} 个输出设备，展开下拉框可选。")
+        self._update_voice_hint()
+
+    def _refresh_voice_mode(self):
+        enabled = bool(self.tts_enabled_var.get())
+        real_mode = enabled and (self.voice_send_mode_var.get() or "file").strip().lower() == "real"
+        try:
+            self.real_voice_device_combo.configure(state=("readonly" if enabled else "disabled"))
+            self.real_voice_refresh_btn.configure(state=("normal" if enabled else "disabled"))
+            self.real_voice_delay_ent.configure(state=("normal" if real_mode else "disabled"))
+        except Exception:
+            pass
+        self._update_voice_hint()
 
     def _build_persona_tab(self):
         frm = self.tab_persona
@@ -328,8 +505,8 @@ class SettingsWindow(tk.Toplevel):
         info = (
             "Prompt 预览：\n"
             "- Persona 使用“当前应用”的人格（也就是左侧显示的 当前应用：xxx），而不是右侧编辑框的未保存内容。\n"
-            "- 下面的“模拟聊天记录”会用于替换 {history}/{incoming}。\n"
-            "- 预览仍支持 $ENV_VAR 解析；System 为空会用默认 'You are a helpful assistant.'。\n"
+            "- 下面的“模拟聊天记录 / 识图结果”会用于替换 {history}/{incoming}/{image_context}。\n"
+            "- 预览会显示最终的 JSON action 请求。\n"
         )
         ttk.Label(frm, text=info, wraplength=760).pack(anchor="w")
 
@@ -342,6 +519,7 @@ class SettingsWindow(tk.Toplevel):
             "[对方] 测试消息1\n[对方] 测试消息2\n[自己] 测试消息3\n[自己] 测试消息4"
         )
         self._preview_incoming_sample = "[对方] 测试消息5"
+        self._preview_image_sample = "图片里是一只举牌子的白猫，图片上有‘思源神是正常的’这行字。"
 
         ttk.Label(sim, text="history（{history}）").pack(anchor="w")
         self.preview_history_text = tk.Text(sim, height=6, wrap="none", font=FONT_MONO)
@@ -353,12 +531,19 @@ class SettingsWindow(tk.Toplevel):
         self.preview_incoming_text.pack(fill="x", pady=(2, 0))
         self.preview_incoming_text.insert("1.0", self._preview_incoming_sample)
 
+        ttk.Label(sim, text="image_context（{image_context}）").pack(anchor="w", pady=(8, 0))
+        self.preview_image_text = tk.Text(sim, height=4, wrap="none", font=FONT_MONO)
+        self.preview_image_text.pack(fill="x", pady=(2, 0))
+        self.preview_image_text.insert("1.0", self._preview_image_sample)
+
         def _reset_samples():
             try:
                 self.preview_history_text.delete("1.0", tk.END)
                 self.preview_history_text.insert("1.0", self._preview_history_sample)
                 self.preview_incoming_text.delete("1.0", tk.END)
                 self.preview_incoming_text.insert("1.0", self._preview_incoming_sample)
+                self.preview_image_text.delete("1.0", tk.END)
+                self.preview_image_text.insert("1.0", self._preview_image_sample)
             except Exception:
                 pass
             self.refresh_prompt_preview()
@@ -395,19 +580,6 @@ class SettingsWindow(tk.Toplevel):
         elif tab_id == str(self.tab_persona):
             self._persona_ensure_selection()
 
-    def _build_split_rules(self, split_delimiter: str) -> str:
-        d = (split_delimiter or "").strip()
-        if not d:
-            return ""
-        return (
-            "【输出格式规则】\n"
-            "- 你的最终输出只能是“回复文本”，不要加前缀/解释/markdown。\n"
-            "- 你可以输出 1 条或多条消息。\n"
-            f"- 如果输出多条消息：必须用分隔符 {d} 分隔各条消息。\n"
-            "- 分隔符不要出现在开头或结尾。\n"
-            f"- 示例：你好{d}最近咋样？\n"
-        )
-
     def _get_applied_persona_text(self) -> str:
         name = (self.cfg.persona_file or "").strip()
         if not name:
@@ -421,73 +593,36 @@ class SettingsWindow(tk.Toplevel):
         system_prompt_raw = self.system_text.get("1.0", tk.END).rstrip("\n")
         user_template_raw = self.user_text.get("1.0", tk.END).rstrip("\n")
 
-        system_prompt = resolve_env(system_prompt_raw).strip()
-        user_template = resolve_env(user_template_raw).strip() or "{incoming}"
-
-        split_delimiter = (
-            self.split_delim_var.get() or "<<<NEXT>>>"
-        ).strip() or "<<<NEXT>>>"
-        split_rules = self._build_split_rules(split_delimiter)
-
         persona = self._get_applied_persona_text()
 
         try:
             history_text = self.preview_history_text.get("1.0", tk.END).rstrip("\n")
             incoming_text = self.preview_incoming_text.get("1.0", tk.END).rstrip("\n")
+            image_text = self.preview_image_text.get("1.0", tk.END).rstrip("\n")
         except Exception:
             history_text = self._preview_history_sample
             incoming_text = self._preview_incoming_sample
+            image_text = self._preview_image_sample
 
-        sticker_enabled = bool(getattr(self.cfg, "sticker_selector_enabled", False))
-        sticker_prompt = (
-            getattr(self.cfg, "sticker_selector_prompt", "") or ""
-        ).strip()
-
-        sys_parts = [system_prompt or "You are a helpful assistant."]
-
-        if persona:
-            sys_parts.append("【人格设定】\n" + persona)
-
-        if sticker_enabled and sticker_prompt:
-            sys_parts.append("【表情包提示】\n" + sticker_prompt)
-
-        if split_rules:
-            sys_parts.append(split_rules)
-
-        system_final = "\n\n".join(sys_parts)
-
-        try:
-            user_prompt = user_template.format(
-                history=history_text,
-                incoming=incoming_text,
-            )
-        except Exception as exc:  # noqa: BLE001
-            user_prompt = f"（User Template 格式化失败：{exc}）"
-
-        if split_rules and not user_prompt.startswith("（User Template 格式化失败"):
-            user_prompt = user_prompt + "\n\n【再次强调输出格式】\n" + split_rules
-
-        model = resolve_env(self.model_var.get() or "").strip()
-        try:
-            temperature = float((self.temp_var.get() or "").strip())
-        except Exception:
-            temperature = self.store.settings.temperature
-
-        payload = {
-            "model": model or "(empty model)",
-            "messages": [
-                {"role": "system", "content": system_final},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": temperature,
-        }
-
-        self._set_prompt_preview_text(self.prompt_preview_system, system_final)
-        self._set_prompt_preview_text(self.prompt_preview_user, user_prompt)
-        self._set_prompt_preview_text(
-            self.prompt_preview_payload,
-            json.dumps(payload, ensure_ascii=False, indent=2),
+        client = self._make_preview_client()
+        req = client.build_request(
+            history_text,
+            incoming_text,
+            persona_text=persona,
+            image_context=image_text,
+            allow_sticker=bool(self.sticker_enabled_var.get()),
+            allow_voice=bool(self.tts_enabled_var.get()),
         )
+
+        if "error" in req:
+            self._set_prompt_preview_text(self.prompt_preview_system, str(req["error"]))
+            self._set_prompt_preview_text(self.prompt_preview_user, str(req["error"]))
+            self._set_prompt_preview_text(self.prompt_preview_payload, str(req["error"]))
+            return
+
+        self._set_prompt_preview_text(self.prompt_preview_system, req.get("system", ""))
+        self._set_prompt_preview_text(self.prompt_preview_user, req.get("user", ""))
+        self._set_prompt_preview_text(self.prompt_preview_payload, json.dumps(req.get("payload", {}), ensure_ascii=False, indent=2))
 
     def _make_preview_client(self):
         provider = (self.provider_var.get() or "mock").strip().lower()
@@ -503,6 +638,15 @@ class SettingsWindow(tk.Toplevel):
 
         system_prompt = self.system_text.get("1.0", tk.END).rstrip("\n")
         user_template = self.user_text.get("1.0", tk.END).rstrip("\n")
+        vision_model = self.vision_model_var.get().strip()
+        vision_prompt = self.vision_prompt_text.get("1.0", tk.END).rstrip("\n")
+        tts_provider = (self.tts_provider_var.get() or "openai").strip().lower() or "openai"
+        tts_model = self.tts_model_var.get().strip()
+        tts_voice = self.tts_voice_var.get().strip()
+        tts_format = (self.tts_format_var.get() or "mp3").strip()
+        tts_language_type = (self.tts_language_type_var.get() or "auto").strip() or "auto"
+        tts_api_key = self.tts_api_key_var.get().strip()
+        tts_base_url = self.tts_base_url_var.get().strip()
 
         if provider == "openai":
             return OpenAIClient(
@@ -512,6 +656,33 @@ class SettingsWindow(tk.Toplevel):
                 temperature=temperature,
                 system_prompt=system_prompt,
                 user_template=user_template,
+                vision_model=vision_model,
+                vision_prompt=vision_prompt,
+                tts_provider=tts_provider,
+                tts_model=tts_model,
+                tts_voice=tts_voice,
+                tts_format=tts_format,
+                tts_language_type=tts_language_type,
+                tts_api_key=tts_api_key,
+                tts_base_url=tts_base_url,
+            )
+        if provider == "siliconflow":
+            return SiliconFlowClient(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                temperature=temperature,
+                system_prompt=system_prompt,
+                user_template=user_template,
+                vision_model=vision_model,
+                vision_prompt=vision_prompt,
+                tts_provider=tts_provider,
+                tts_model=tts_model,
+                tts_voice=tts_voice,
+                tts_format=tts_format,
+                tts_language_type=tts_language_type,
+                tts_api_key=tts_api_key,
+                tts_base_url=tts_base_url,
             )
         return MockLLMClient()
 
@@ -821,6 +992,15 @@ class SettingsWindow(tk.Toplevel):
         s.model = self.model_var.get().strip()
         s.system_prompt = self.system_text.get("1.0", tk.END).rstrip("\n")
         s.user_template = self.user_text.get("1.0", tk.END).rstrip("\n")
+        s.vision_model = self.vision_model_var.get().strip()
+        s.vision_prompt = self.vision_prompt_text.get("1.0", tk.END).rstrip("\n")
+        s.tts_provider = (self.tts_provider_var.get() or "openai").strip().lower() or "openai"
+        s.tts_model = self.tts_model_var.get().strip()
+        s.tts_voice = self.tts_voice_var.get().strip()
+        s.tts_format = (self.tts_format_var.get() or "mp3").strip() or "mp3"
+        s.tts_language_type = (self.tts_language_type_var.get() or "auto").strip() or "auto"
+        s.tts_api_key = self.tts_api_key_var.get().strip()
+        s.tts_base_url = self.tts_base_url_var.get().strip()
         try:
             s.temperature = float(self.temp_var.get().strip())
         except Exception:  # noqa: BLE001
@@ -842,13 +1022,30 @@ class SettingsWindow(tk.Toplevel):
             messagebox.showerror("错误", "随机最小/最大不是数字")
             return
 
-        self.cfg.split_delimiter = (
-            self.split_delim_var.get() or "<<<NEXT>>>"
-        ).strip() or "<<<NEXT>>>"
         try:
             self.cfg.split_speed_multiplier = float(self.speed_mult_var.get().strip())
         except Exception:  # noqa: BLE001
             messagebox.showerror("错误", "速度倍率不是数字")
+            return
+
+        self.cfg.sticker_selector_enabled = bool(self.sticker_enabled_var.get())
+        self.cfg.sticker_selector_api = self.sticker_api_var.get().strip()
+        try:
+            self.cfg.sticker_selector_k = int((self.sticker_k_var.get() or "3").strip())
+        except Exception:  # noqa: BLE001
+            messagebox.showerror("错误", "贴图候选数 k 不是整数")
+            return
+        self.cfg.sticker_selector_random = bool(self.sticker_random_var.get())
+        self.cfg.sticker_selector_prompt = self.sticker_prompt_text.get("1.0", tk.END).rstrip("\n")
+        self.cfg.vision_enabled = bool(self.vision_enabled_var.get())
+        self.cfg.tts_enabled = bool(self.tts_enabled_var.get())
+        self.cfg.voice_send_mode = (self.voice_send_mode_var.get() or "file").strip().lower() or "file"
+        selected_device = (self.real_voice_device_var.get() or "").strip()
+        self.cfg.real_voice_output_device = "" if selected_device == DEFAULT_OUTPUT_DEVICE_LABEL else selected_device
+        try:
+            self.cfg.real_voice_start_delay_sec = float(self.real_voice_delay_var.get().strip())
+        except Exception:  # noqa: BLE001
+            messagebox.showerror("错误", "真语音录音校准秒数不是数字")
             return
 
         self.store.save()

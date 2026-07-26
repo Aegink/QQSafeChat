@@ -101,6 +101,9 @@ class HistoryStore:
                     obj.setdefault("ts", time.time())
                     obj.setdefault("sender", "unknown")
                     obj.setdefault("text", "")
+                    obj.setdefault("msg_type", "text")
+                    obj.setdefault("image_path", "")
+                    obj.setdefault("image_summary", "")
                     
                     try:
                         ts_val = float(obj.get("ts") or time.time())
@@ -170,6 +173,9 @@ class HistoryStore:
                         "ts": ts_val,
                         "sender": str(it.get("sender") or "unknown"),
                         "text": self._ensure_ts_prefix(ts_val, str(it.get("text") or "")),
+                        "msg_type": str(it.get("msg_type") or "text"),
+                        "image_path": str(it.get("image_path") or ""),
+                        "image_summary": str(it.get("image_summary") or ""),
                     }
                     f.write(json.dumps(it2, ensure_ascii=False) + "\n")
         except Exception:
@@ -297,6 +303,9 @@ class HistoryStore:
                 "ts": ts,
                 "sender": sender,
                 "text": text_with_ts,
+                "msg_type": str(getattr(m, "msg_type", "text") or "text"),
+                "image_path": str(getattr(m, "image_path", "") or ""),
+                "image_summary": str(getattr(m, "image_summary", "") or ""),
             })
 
         if len(self.items) > self.max_messages:
@@ -321,9 +330,19 @@ class HistoryStore:
         for it in data:
             sender = str(it.get("sender") or "unknown")
             who = "自己" if sender == "self" else ("对方" if sender == "other" else "未知")
+            msg_type = str(it.get("msg_type") or "text")
+            image_summary = str(it.get("image_summary") or "").strip()
 
             text = str(it.get("text") or "")
             ts_in_text, body = self._split_ts_prefix(text)
+
+            if msg_type == "image":
+                ts_str = ts_in_text or self._fmt_ts(it.get("ts"))
+                image_text = "[图片]"
+                if image_summary:
+                    image_text += f" {image_summary}"
+                lines.append(f"[{ts_str}] [{who}] {image_text}")
+                continue
 
             if ts_in_text:
                 
